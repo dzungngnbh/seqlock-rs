@@ -1,0 +1,166 @@
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{fence, AtomicBool, AtomicU8, Ordering};
+use std::{hint, ptr};
+
+pub struct SeqLock<T> {
+    seq: AtomicU8,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SeqLock<T> {}
+unsafe impl<T: Sync> Sync for SeqLock<T> {}
+
+pub struct SeqLockGuard<'a, T> {
+    seq_lock: &'a SeqLock<T>,
+    // we store seq here to avoid loading it from seq_lock when dropping
+    seq: u8,
+}
+
+impl<'a, T> Drop for SeqLockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.seq_lock.end_write(self.seq);
+    }
+}
+
+impl<'a, T> Deref for SeqLockGuard<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.seq_lock.data.get() }
+    }
+}
+
+impl<'a, T> DerefMut for SeqLockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.seq_lock.data.get() }
+    }
+}
+
+impl<T> SeqLock<T> {
+    #[inline]
+    pub fn new(data: T) -> Self {
+        SeqLock {
+            seq: AtomicU8::new(0),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    /// Blocking read
+    ///
+    /// It will check if the lock is acquired (writing) otherwise it will return data
+    pub fn read(&self) -> T {
+        loop {
+            let seq1 = self.seq.load(Acquire);
+
+            // if seq is odd then writing is writing
+            if seq1 & 1 != 0 {
+                // perf: you can yield_now for throughput or spin for latency
+                for _ in 0..10 {
+                    hint::spin_loop();
+                }
+                continue;
+            }
+
+            // Double check:
+            // We need to use a volatile read here because the data may be
+            // concurrently modified by a writer. We also use MaybeUninit in
+            // case we read the data in the middle of a modification.
+            let result = unsafe { ptr::read_volatile(self.data.get() as *mut MaybeUninit<T>) };
+            fence(Acquire);
+
+            let seq2 = self.seq.load(Relaxed);
+            if seq1 == seq2 {
+                return unsafe { result.assume_init() };
+            }
+        }
+    }
+
+    /// Lock
+    /// Blocking until the lock is acquired
+    ///
+    /// Returns a guard that releases the lock when dropped.
+    pub fn lock(&self) -> SeqLockGuard<T> {
+        let mut seq = self.seq.load(Relaxed);
+        if seq & 1 == 0
+            && self
+            .seq
+            .compare_exchange(seq, seq.wrapping_add(1), Acquire, Relaxed)
+            .is_ok()
+        {
+            return SeqLockGuard { seq_lock: self, seq: seq.wrapping_add(1) };
+        } else {
+            seq = self.lock_contended();
+        }
+
+        SeqLockGuard { seq_lock: self, seq: seq.wrapping_add(1) }
+    }
+
+    #[cold]
+    fn lock_contended(&self) -> u8 {
+        loop {
+            let current_seq = self.spin();
+
+            if current_seq & 1 == 0
+                && self
+                .seq
+                .compare_exchange(current_seq, current_seq.wrapping_add(1), Acquire, Relaxed)
+                .is_ok()
+            {
+                return current_seq.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Returns the current seq number
+    ///
+    /// This mimics the mutex implementation
+    #[inline]
+    fn spin(&self) -> u8 {
+        let mut spin = 50;
+        loop {
+            let seq = self.seq.load(Relaxed);
+            if seq & 1 == 0 {
+                return seq;
+            }
+
+            // We return when the mutex is starved or end of spin
+            if spin == 0 {
+                return seq;
+            }
+
+            hint::spin_loop();
+            spin -= 1;
+        }
+    }
+
+    fn begin_write(&self) {
+        let seq = self.seq.load(Relaxed).wrapping_add(1);
+        self.seq.store(seq, Relaxed);
+
+        // make sure we increase the seq number before writing data
+        fence(Release);
+    }
+
+    // Being used in lock guard to drop the lock
+    fn end_write(&self, seq: u8) {
+        self.seq.store(seq.wrapping_add(1), Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanity() {
+        let seq_lock = SeqLock::new(123);
+
+        for _ in 0..100 {
+            let mut guard = seq_lock.lock();
+            *guard += 1;
+        }
+    }
+}
